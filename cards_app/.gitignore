@@ -1,0 +1,11 @@
+# Credentials & Secrets
+credentials.json
+*.json
+secrets.toml
+
+# Python / Cache
+*.parquet
+__pycache__/
+*.pyc
+.env
+.venv/
