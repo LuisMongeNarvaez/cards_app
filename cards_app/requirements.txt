@@ -1,0 +1,5 @@
+streamlit
+gspread
+polars
+google-auth
+requests
