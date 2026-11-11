@@ -203,6 +203,11 @@ st.sidebar.markdown("---")
 # --- SIDEBAR: FILTERS ---
 st.sidebar.header("Filter Collection")
 
+# Checkbox toggle for Qty > 0
+hide_out_of_stock = st.sidebar.checkbox(
+    "Hide Out-of-Stock Cards (Qty = 0)", value=True
+)
+
 # 1. Sport Filter
 sports_list = []
 if "Sport" in df.columns:
@@ -234,6 +239,10 @@ search_query = st.sidebar.text_input("Search Player, Set, or Notes:").strip()
 # --- FILTERING LOGIC ---
 filtered_df = df
 
+# Filter out 0-quantity cards if checked
+if hide_out_of_stock and "Qty" in filtered_df.columns:
+    filtered_df = filtered_df.filter(pl.col("Qty") > 0)
+
 if "Sport" in df.columns and selected_sports:
     filtered_df = filtered_df.filter(pl.col("Sport").is_in(selected_sports))
 elif "Sport" in df.columns and not selected_sports:
@@ -245,7 +254,6 @@ if selected_tags:
         pl.col("Notes").str.contains(rf"\b{tag}\b", literal=False)
         for tag in selected_tags
     ]
-    # Combine conditions with logical OR (|)
     combined_tag_filter = tag_conditions[0]
     for cond in tag_conditions[1:]:
         combined_tag_filter = combined_tag_filter | cond
