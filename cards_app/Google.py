@@ -58,7 +58,7 @@ def safe_add_card(
         str(team),
         str(sport),
         est_val_formatted,
-        "$0.00",
+        "",  # Let spreadsheet formula calculate Total Value
         str(notes),
     ]
 
@@ -66,7 +66,7 @@ def safe_add_card(
     st.cache_data.clear()
 
 
-# --- 2. FAST READ & CACHE VIA POLARS ---
+# --- 2. FAST READ & CACHE VIA POLARS (PURE SPREADSHEET READ) ---
 @st.cache_data(ttl=60)
 def load_and_cache_data():
     response = requests.get(csv_url)
@@ -120,33 +120,28 @@ def load_and_cache_data():
     else:
         df = df.with_columns(pl.lit(0.0).alias("Qty"))
 
-    # --- DYNAMIC PRICING LOGIC ---
+    # --- READ ESTIMATE VALUE DIRECTLY FROM SHEET ---
     if "Estimate Value" in df.columns:
-        parsed_est_val = (
+        df = df.with_columns(
             pl.col("Estimate Value")
             .cast(pl.Utf8)
             .str.replace_all(r"[\$,]", "")
             .cast(pl.Float64, strict=False)
-            .fill_null(0.15)
-        )
-
-        df = df.with_columns(
-            pl.when(
-                pl.col("Notes").str.contains(r"\b(RC|HOF)\b", literal=False) &
-                (parsed_est_val < 2.50)
-            )
-            .then(2.50)
-            .when(pl.col("Set Name").str.contains("1966|1968", literal=False))
-            .then(0.50)
-            .otherwise(parsed_est_val)
+            .fill_null(0.0)
             .alias("Estimate_Value_Num")
         )
     else:
-        df = df.with_columns(pl.lit(0.15).alias("Estimate_Value_Num"))
+        df = df.with_columns(pl.lit(0.0).alias("Estimate_Value_Num"))
 
+    # --- READ TOTAL VALUE DIRECTLY FROM SHEET ---
     if "Total Value" in df.columns:
         df = df.with_columns(
-            (pl.col("Qty") * pl.col("Estimate_Value_Num")).alias("Total Value_Num")
+            pl.col("Total Value")
+            .cast(pl.Utf8)
+            .str.replace_all(r"[\$,]", "")
+            .cast(pl.Float64, strict=False)
+            .fill_null(0.0)
+            .alias("Total Value_Num")
         )
     else:
         df = df.with_columns(pl.lit(0.0).alias("Total Value_Num"))
@@ -220,7 +215,6 @@ st.sidebar.markdown("---")
 # --- SIDEBAR: FILTERS ---
 st.sidebar.header("Filter Collection")
 
-# Quick View Toggle for HOF / RC In-Stock
 show_hof_rc_only = st.sidebar.checkbox(
     "⭐ Show HOF & RC Cards Only", 
     value=False,
@@ -259,7 +253,6 @@ filtered_df = df
 if "Qty" in filtered_df.columns:
     filtered_df = filtered_df.filter(pl.col("Qty") > 0)
 
-# Apply HOF/RC Quick Filter if checked
 if show_hof_rc_only:
     filtered_df = filtered_df.filter(
         pl.col("Notes").str.contains(r"\b(RC|HOF)\b", literal=False)
@@ -290,7 +283,7 @@ if search_query:
     )
 
 # --- MAIN INVENTORY VIEW & METRICS ---
-total_entries = len(filtered_df)
+total_entries = int(filtered_df["Qty"].sum()) if "Qty" in filtered_df.columns else len(filtered_df)
 total_val = (
     filtered_df["Total Value_Num"].sum()
     if "Total Value_Num" in filtered_df.columns
