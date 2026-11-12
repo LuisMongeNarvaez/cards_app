@@ -120,19 +120,36 @@ def load_and_cache_data():
     else:
         df = df.with_columns(pl.lit(0.0).alias("Qty"))
 
-    for col_name in ["Estimate Value", "Total Value"]:
-        num_col = f"{col_name}_Num"
-        if col_name in df.columns:
-            df = df.with_columns(
-                pl.col(col_name)
-                .cast(pl.Utf8)
-                .str.replace_all(r"[\$,]", "")
-                .cast(pl.Float64, strict=False)
-                .fill_null(0.0)
-                .alias(num_col)
+    # --- DYNAMIC PRICING LOGIC ---
+    if "Estimate Value" in df.columns:
+        parsed_est_val = (
+            pl.col("Estimate Value")
+            .cast(pl.Utf8)
+            .str.replace_all(r"[\$,]", "")
+            .cast(pl.Float64, strict=False)
+            .fill_null(0.15)
+        )
+
+        df = df.with_columns(
+            pl.when(
+                pl.col("Notes").str.contains(r"\b(RC|HOF)\b", literal=False) &
+                (parsed_est_val < 2.50)
             )
-        else:
-            df = df.with_columns(pl.lit(0.0).alias(num_col))
+            .then(2.50)
+            .when(pl.col("Set Name").str.contains("1966|1968", literal=False))
+            .then(0.50)
+            .otherwise(parsed_est_val)
+            .alias("Estimate_Value_Num")
+        )
+    else:
+        df = df.with_columns(pl.lit(0.15).alias("Estimate_Value_Num"))
+
+    if "Total Value" in df.columns:
+        df = df.with_columns(
+            (pl.col("Qty") * pl.col("Estimate_Value_Num")).alias("Total Value_Num")
+        )
+    else:
+        df = df.with_columns(pl.lit(0.0).alias("Total Value_Num"))
 
     df.write_parquet(parquet_cache)
     return df
@@ -203,12 +220,13 @@ st.sidebar.markdown("---")
 # --- SIDEBAR: FILTERS ---
 st.sidebar.header("Filter Collection")
 
-# Checkbox toggle for Qty > 0
-hide_out_of_stock = st.sidebar.checkbox(
-    "Hide Out-of-Stock Cards (Qty = 0)", value=True
+# Quick View Toggle for HOF / RC In-Stock
+show_hof_rc_only = st.sidebar.checkbox(
+    "⭐ Show HOF & RC Cards Only", 
+    value=False,
+    help="Instantly filter view to show only in-stock Hall of Fame and Rookie cards."
 )
 
-# 1. Sport Filter
 sports_list = []
 if "Sport" in df.columns:
     sports_list = sorted(
@@ -223,7 +241,6 @@ selected_sports = st.sidebar.multiselect(
     "Select Sport:", options=sports_list, default=sports_list
 )
 
-# 2. Tag / Attribute Filter (RC, VAR, HOF)
 st.sidebar.subheader("🏷️ Tag / Attribute Filter")
 available_tags = ["RC", "VAR", "HOF", "UER", "SSS", "CPC"]
 selected_tags = st.sidebar.multiselect(
@@ -233,22 +250,26 @@ selected_tags = st.sidebar.multiselect(
     help="Select tags to filter records containing specific attributes like Rookie (RC) or Hall of Fame (HOF)."
 )
 
-# 3. Text Search
 search_query = st.sidebar.text_input("Search Player, Set, or Notes:").strip()
 
 # --- FILTERING LOGIC ---
 filtered_df = df
 
-# Filter out 0-quantity cards if checked
-if hide_out_of_stock and "Qty" in filtered_df.columns:
+# Permanently enforce showing only in-stock cards (Qty > 0)
+if "Qty" in filtered_df.columns:
     filtered_df = filtered_df.filter(pl.col("Qty") > 0)
+
+# Apply HOF/RC Quick Filter if checked
+if show_hof_rc_only:
+    filtered_df = filtered_df.filter(
+        pl.col("Notes").str.contains(r"\b(RC|HOF)\b", literal=False)
+    )
 
 if "Sport" in df.columns and selected_sports:
     filtered_df = filtered_df.filter(pl.col("Sport").is_in(selected_sports))
 elif "Sport" in df.columns and not selected_sports:
     filtered_df = filtered_df.head(0)
 
-# Filter by selected Tags (OR condition: matches if Notes contains any selected tag)
 if selected_tags:
     tag_conditions = [
         pl.col("Notes").str.contains(rf"\b{tag}\b", literal=False)
@@ -260,7 +281,6 @@ if selected_tags:
         
     filtered_df = filtered_df.filter(combined_tag_filter)
 
-# Filter by free-text Search Query
 if search_query:
     q_lower = search_query.lower()
     filtered_df = filtered_df.filter(
@@ -269,100 +289,72 @@ if search_query:
         | pl.col("Notes").str.to_lowercase().str.contains(q_lower, literal=True)
     )
 
-# --- MAIN DASHBOARD TABS ---
-tab1, tab2 = st.tabs(["📋 Inventory Table", "📊 Set Completion Analysis"])
+# --- MAIN INVENTORY VIEW & METRICS ---
+total_entries = len(filtered_df)
+total_val = (
+    filtered_df["Total Value_Num"].sum()
+    if "Total Value_Num" in filtered_df.columns
+    else 0.0
+)
 
-# TAB 1: INVENTORY TABLE
-with tab1:
-    total_entries = len(filtered_df)
-    total_cards = (
-        int(filtered_df["Qty"].sum()) if "Qty" in filtered_df.columns else 0
+col1, col2 = st.columns(2)
+col1.metric("In-Stock Cards", f"{total_entries:,}")
+col2.metric("Estimated Sale Value", f"${total_val:,.2f}")
+
+st.markdown("---")
+
+# --- VALUE BREAKDOWN GRAPHIC & SUMMARY (HIDDEN INSIDE EXPANDER) ---
+if len(filtered_df) > 0:
+    chart_df = filtered_df.with_columns(
+        pl.when(pl.col("Notes").str.contains(r"\bRC\b", literal=False))
+        .then(pl.lit("Rookie Cards (RC)"))
+        .when(pl.col("Notes").str.contains(r"\bHOF\b", literal=False))
+        .then(pl.lit("Hall of Famers (HOF)"))
+        .when(pl.col("Set Name").str.contains("1966|1968", literal=False))
+        .then(pl.lit("Vintage Sets (1966/1968)"))
+        .otherwise(pl.lit("Standard Inventory"))
+        .alias("Card Tier")
     )
-    total_val = (
-        filtered_df["Total Value_Num"].sum()
-        if "Total Value_Num" in filtered_df.columns
-        else 0.0
+    
+    tier_summary = (
+        chart_df.group_by("Card Tier")
+        .agg([
+            pl.col("Total Value_Num").sum().alias("Total Value ($)"),
+            pl.count().alias("Card Quantity")
+        ])
+        .sort("Total Value ($)", descending=True)
+        .to_pandas()
     )
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Filtered Card Entries", f"{total_entries:,}")
-    col2.metric("Filtered Cards Owned (Qty)", f"{total_cards:,}")
-    col3.metric("Filtered Collection Value", f"${total_val:,.2f}")
+    with st.expander("📊 Collection Breakdown by Tier (Quantities & Values)", expanded=False):
+        st.bar_chart(
+            data=tier_summary,
+            x="Card Tier",
+            y=["Total Value ($)", "Card Quantity"],
+            use_container_width=True
+        )
+        st.dataframe(tier_summary, use_container_width=True, hide_index=True)
 
-    st.markdown("---")
+st.markdown("---")
 
-    display_cols = [
-        c
-        for c in [
-            "Card Number",
-            "Set Name",
-            "Qty",
-            "Player",
-            "Team",
-            "Sport",
-            "Estimate Value",
-            "Total Value",
-            "Notes",
-        ]
-        if c in filtered_df.columns
+display_cols = [
+    c
+    for c in [
+        "Card Number",
+        "Set Name",
+        "Qty",
+        "Player",
+        "Team",
+        "Sport",
+        "Estimate Value",
+        "Total Value",
+        "Notes",
     ]
+    if c in filtered_df.columns
+]
 
-    st.dataframe(
-        filtered_df.select(display_cols).to_pandas(),
-        use_container_width=True,
-        height=550,
-    )
-
-# TAB 2: SET COMPLETION CALCULATOR
-with tab2:
-    st.header("Set Completion Calculator")
-
-    available_sets = sorted(
-        [
-            s
-            for s in filtered_df["Set Name"].unique().to_list()
-            if s is not None and str(s).strip() != ""
-        ]
-    )
-
-    if available_sets:
-        selected_set = st.selectbox("Select a Set to Analyze:", available_sets)
-
-        if selected_set:
-            set_df = filtered_df.filter(pl.col("Set Name") == selected_set)
-            max_qty = int(set_df["Qty"].max()) if len(set_df) > 0 else 0
-            total_set_cards = len(set_df)
-
-            st.write(
-                f"**Total unique card slots logged for {selected_set}:** {total_set_cards}"
-            )
-
-            if max_qty > 0:
-                completion_data = []
-                for k in range(1, max_qty + 1):
-                    cards_collected = len(set_df.filter(pl.col("Qty") >= k))
-                    if cards_collected > 0:
-                        pct = (cards_collected / total_set_cards) * 100
-                        completion_data.append(
-                            {
-                                "Set Stack": f"Set #{k}",
-                                "Cards Collected": cards_collected,
-                                "Completion %": f"{pct:.1f}%",
-                            }
-                        )
-
-                completion_df = pl.DataFrame(completion_data)
-
-                col_a, col_b = st.columns([1, 2])
-                with col_a:
-                    st.dataframe(completion_df.to_pandas(), height=400)
-                with col_b:
-                    st.bar_chart(
-                        data=completion_df.to_pandas(),
-                        x="Set Stack",
-                        y="Cards Collected",
-                    )
-            else:
-                st.info("No cards owned (Qty > 0) for this set.")
-    else:
-        st.warning("No sets match your current filters.")
+st.dataframe(
+    filtered_df.select(display_cols).to_pandas(),
+    use_container_width=True,
+    height=550,
+)
