@@ -320,7 +320,7 @@ if len(filtered_df) > 0:
         chart_df.group_by("Card Tier")
         .agg([
             pl.col("Total Value_Num").sum().alias("Total Value ($)"),
-            pl.count().alias("Card Quantity")
+            pl.len().alias("Card Quantity")
         ])
         .sort("Total Value ($)", descending=True)
         .to_pandas()
